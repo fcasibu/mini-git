@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use bincode::{self, Decode, Encode, config};
 use clap::{Parser, Subcommand};
 use flate2::Compression;
 use flate2::write::{ZlibDecoder, ZlibEncoder};
@@ -37,16 +38,19 @@ enum GitObjects {
 struct Repository {
     objects_dir: PathBuf,
     mini_git_dir: PathBuf,
+    index_file: PathBuf,
 }
 
 impl Repository {
     pub fn new() -> Result<Self> {
         let mini_git_dir = env::current_dir()?.join(".mini-git");
         let objects_dir = mini_git_dir.join("objects");
+        let index_file = mini_git_dir.join("index");
 
         Ok(Repository {
             objects_dir,
             mini_git_dir,
+            index_file,
         })
     }
 
@@ -84,6 +88,13 @@ impl Repository {
                 .with_context(|| format!("Failed to write HEAD file at {}", head_file.display()))?;
         }
 
+        let index_file = mini_git_dir.join("index");
+        if !index_file.exists() {
+            fs::write(&index_file, "").with_context(|| {
+                format!("Failed to write index file at {}", index_file.display())
+            })?;
+        }
+
         Ok(())
     }
 
@@ -119,6 +130,77 @@ impl Repository {
         Ok(encoded_hash)
     }
 
+    pub fn add_to_index(&self, file_path: &PathBuf) -> Result<()> {
+        let index_file = &self.index_file;
+        let file_path_buf = file_path.to_path_buf();
+
+        if !index_file.is_file() {
+            return Err(anyhow!(
+                "fatal: not a mini-git repository (or any of the parent directories): .mini-git"
+            ));
+        }
+
+        if !file_path.exists() {
+            return Err(anyhow!("Failed to read {:?}", file_path));
+        }
+
+        let data = fs::read_to_string(&file_path)
+            .with_context(|| format!("Failed to read file {}", file_path.display()))?;
+
+        let blob = BlobObject::new(&data)?;
+
+        let mut index = self.read_index()?;
+
+        if let Some(pos) = index.entries.iter().position(|e| e.path == file_path_buf) {
+            if index.entries[pos].sha1 != blob.hash {
+                index.entries[pos] = IndexEntry {
+                    mode: 100644,
+                    sha1: blob.hash,
+                    path: file_path_buf,
+                };
+            }
+        } else {
+            index.entries.push(IndexEntry {
+                mode: 100644,
+                sha1: blob.hash,
+                path: file_path_buf,
+            });
+        }
+
+        fs::write(
+            &index_file,
+            bincode::encode_to_vec(&index, config::standard())?,
+        )
+        .with_context(|| format!("Failed to write index file"))?;
+
+        Ok(())
+    }
+
+    pub fn read_index(&self) -> Result<IndexFile> {
+        let index_file = &self.index_file;
+
+        if !index_file.is_file() {
+            return Err(anyhow!(
+                "fatal: not a mini-git repository (or any of the parent directories): .mini-git"
+            ));
+        }
+
+        let index_data = fs::read(&index_file)
+            .with_context(|| format!("Failed to read index file {}", index_file.display()))?;
+
+        if index_data.is_empty() {
+            return Ok(IndexFile {
+                entries: Vec::new(),
+            });
+        }
+
+        let (index, _): (IndexFile, usize) =
+            bincode::decode_from_slice(&index_data, config::standard())
+                .context("Failed to decode index file")?;
+
+        Ok(index)
+    }
+
     pub fn read_object(&self, object_hash_str: &str) -> Result<GitObjects> {
         let objects_dir = &self.objects_dir;
 
@@ -141,9 +223,14 @@ impl Repository {
         let decompressed_data = decompress_content(&compressed_data)
             .with_context(|| format!("Failed to decompress object {}", object_hash_str))?;
 
-        let position = decompressed_data.find(' ').unwrap();
+        let position = decompressed_data
+            .find(' ')
+            .with_context(|| format!("Invalid content {}", object_hash_str))?;
+
         let object_type = &decompressed_data[0..position];
-        let null_terminator_position = decompressed_data.find('\0').unwrap();
+        let null_terminator_position = decompressed_data
+            .find('\0')
+            .with_context(|| format!("Invalid content {}", object_hash_str))?;
 
         match object_type {
             "blob" => Ok(GitObjects::Blob(BlobObject::new(
@@ -168,6 +255,19 @@ impl Repository {
     }
 }
 
+#[derive(Encode, Decode, Debug)]
+// TODO(fcasibu): ctime, mtime
+struct IndexEntry {
+    mode: u32,
+    sha1: [u8; 20],
+    path: PathBuf,
+}
+
+#[derive(Encode, Decode, Debug)]
+struct IndexFile {
+    entries: Vec<IndexEntry>,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "mini-git", version, about = "A simplified Git clone")]
 struct Cli {
@@ -179,6 +279,7 @@ struct Cli {
 enum Commands {
     /// Initialize a new MiniGit repository
     Init,
+
     /// Compute object ID and optionally creates a blob from a file
     HashObject {
         file_path: Option<String>,
@@ -187,6 +288,7 @@ enum Commands {
         #[arg(short)]
         write: bool,
     },
+
     /// Provide content or type information for repository objects
     CatFile {
         object_hash_input: Option<String>,
@@ -198,6 +300,13 @@ enum Commands {
         /// Pretty-print given object content
         #[arg(short = 'p', conflicts_with = "show_type")]
         print_content: bool,
+    },
+
+    /// Register file contents in the workking directory to the index
+    UpdateIndex {
+        /// Add files not already in index
+        #[arg(long)]
+        add: String,
     },
 }
 
@@ -320,6 +429,11 @@ fn main() -> Result<()> {
             show_type,
             print_content,
         } => handle_cat_file_command(object_hash_input, show_type, print_content, &repository)?,
+        Commands::UpdateIndex { add } => {
+            let path_buf = PathBuf::new().join(&add);
+
+            repository.add_to_index(&path_buf)?;
+        }
     }
 
     Ok(())
