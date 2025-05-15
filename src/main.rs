@@ -308,6 +308,13 @@ enum Commands {
         #[arg(long)]
         add: String,
     },
+
+    /// Information about files in index/working directory
+    LsFiles {
+        /// Show stage files in output
+        #[arg(long)]
+        stage: bool,
+    },
 }
 
 fn hash_content(content_with_header: &str) -> [u8; 20] {
@@ -412,6 +419,23 @@ fn handle_cat_file_command(
     Ok(())
 }
 
+fn handle_ls_files_command(stage: bool, repository: &Repository) -> Result<()> {
+    if stage {
+        let index_file = repository.read_index()?;
+
+        for entry in index_file.entries {
+            println!(
+                "{} {} {}",
+                entry.mode,
+                encode(entry.sha1),
+                entry.path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -430,9 +454,10 @@ fn main() -> Result<()> {
             print_content,
         } => handle_cat_file_command(object_hash_input, show_type, print_content, &repository)?,
         Commands::UpdateIndex { add } => {
-            let path_buf = PathBuf::new().join(&add);
-
-            repository.add_to_index(&path_buf)?;
+            repository.add_to_index(&PathBuf::new().join(&add))?;
+        }
+        Commands::LsFiles { stage } => {
+            handle_ls_files_command(stage, &repository)?;
         }
     }
 
