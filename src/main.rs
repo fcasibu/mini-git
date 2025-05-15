@@ -98,7 +98,7 @@ impl Repository {
         Ok(())
     }
 
-    pub fn write_object(&self, input_data: &str) -> Result<String> {
+    pub fn write_object(&self, input_data: &str) -> Result<[u8; 20]> {
         let objects_dir = &self.objects_dir;
 
         if !objects_dir.is_dir() {
@@ -127,7 +127,7 @@ impl Repository {
             format!("Failed to write object file {}", object_file_path.display())
         })?;
 
-        Ok(encoded_hash)
+        Ok(blob.hash)
     }
 
     pub fn add_to_index(&self, file_path: &PathBuf) -> Result<()> {
@@ -147,25 +147,27 @@ impl Repository {
         let data = fs::read_to_string(&file_path)
             .with_context(|| format!("Failed to read file {}", file_path.display()))?;
 
-        let blob = BlobObject::new(&data)?;
+        let encoded_hash = self.write_object(&data)?;
 
         let mut index = self.read_index()?;
 
         if let Some(pos) = index.entries.iter().position(|e| e.path == file_path_buf) {
-            if index.entries[pos].sha1 != blob.hash {
+            if index.entries[pos].sha1 != encoded_hash {
                 index.entries[pos] = IndexEntry {
                     mode: 100644,
-                    sha1: blob.hash,
+                    sha1: encoded_hash,
                     path: file_path_buf,
                 };
             }
         } else {
             index.entries.push(IndexEntry {
                 mode: 100644,
-                sha1: blob.hash,
+                sha1: encoded_hash,
                 path: file_path_buf,
             });
         }
+
+        index.entries.sort();
 
         fs::write(
             &index_file,
@@ -255,7 +257,7 @@ impl Repository {
     }
 }
 
-#[derive(Encode, Decode, Debug)]
+#[derive(Encode, Decode, Debug, Ord, PartialOrd, Eq, PartialEq)]
 // TODO(fcasibu): ctime, mtime
 struct IndexEntry {
     mode: u32,
@@ -263,7 +265,7 @@ struct IndexEntry {
     path: PathBuf,
 }
 
-#[derive(Encode, Decode, Debug)]
+#[derive(Encode, Decode, Debug, Ord, PartialOrd, Eq, PartialEq)]
 struct IndexFile {
     entries: Vec<IndexEntry>,
 }
@@ -361,7 +363,7 @@ fn handle_hash_object_command(
     let mut encoded_hash = String::new();
 
     if write {
-        encoded_hash = repository.write_object(&input_data)?;
+        encoded_hash = String::from_utf8(repository.write_object(&input_data)?.to_vec())?;
     }
 
     println!("{}", encoded_hash);
