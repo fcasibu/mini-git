@@ -18,21 +18,63 @@ struct BlobObject {
 }
 
 impl BlobObject {
-    fn new(raw_content: &str) -> Result<Self> {
-        let object_content = format!("blob {}\0{}", raw_content.bytes().len(), raw_content);
-        let compressed_content = compress_content(&object_content)
-            .with_context(|| format!("Failed to compress blob content"))?;
+    pub fn new(raw_content: &str) -> Result<Self> {
+        let raw_bytes = raw_content.as_bytes();
+        let header = format!("blob {}\0", raw_bytes.len());
+
+        let mut object_content = Vec::new();
+        object_content.extend_from_slice(header.as_bytes());
+        object_content.extend_from_slice(raw_bytes);
+
+        let hash = hash_content(&object_content);
+        let compressed_content =
+            compress_content(&object_content).context("Failed to compress blob content")?;
 
         Ok(BlobObject {
-            hash: hash_content(&object_content),
+            hash,
             compressed_content,
             raw_content: raw_content.to_string(),
         })
     }
 }
 
+struct TreeObject {
+    hash: [u8; 20],
+    compressed_content: Vec<u8>,
+    raw_content: Vec<u8>,
+}
+
+impl TreeObject {
+    pub fn new(entries: &[IndexEntry]) -> Result<Self> {
+        let mut raw_content = Vec::new();
+
+        for entry in entries {
+            raw_content.extend_from_slice(entry.mode.to_string().as_bytes());
+            raw_content.push(b' ');
+            raw_content.extend_from_slice(entry.path.to_string_lossy().as_bytes());
+            raw_content.push(0);
+
+            raw_content.extend_from_slice(&entry.sha1);
+        }
+
+        let header = format!("tree {}\0", raw_content.len());
+        let mut full_content = header.as_bytes().to_vec();
+        full_content.extend_from_slice(&raw_content);
+
+        let hash = hash_content(&full_content);
+        let compressed_content = compress_content(&full_content)?;
+
+        Ok(TreeObject {
+            hash,
+            compressed_content,
+            raw_content,
+        })
+    }
+}
+
 enum GitObjects {
     Blob(BlobObject),
+    Tree(TreeObject),
 }
 
 struct Repository {
@@ -98,7 +140,7 @@ impl Repository {
         Ok(())
     }
 
-    pub fn write_object(&self, input_data: &str) -> Result<[u8; 20]> {
+    pub fn write_object(&self, input_data: Option<&str>) -> Result<([u8; 20], String)> {
         let objects_dir = &self.objects_dir;
 
         if !objects_dir.is_dir() {
@@ -107,8 +149,27 @@ impl Repository {
             ));
         }
 
-        let blob = BlobObject::new(&input_data)?;
-        let encoded_hash = encode(blob.hash);
+        let (compressed_content, sha1, encoded_hash) = match input_data {
+            Some(data) => {
+                let blob_object = BlobObject::new(&data)?;
+
+                (
+                    blob_object.compressed_content,
+                    blob_object.hash,
+                    encode(blob_object.hash),
+                )
+            }
+            None => {
+                let index = self.read_index()?;
+                let tree_object = TreeObject::new(&index.entries)?;
+
+                (
+                    tree_object.compressed_content,
+                    tree_object.hash,
+                    encode(tree_object.hash),
+                )
+            }
+        };
 
         let (dir_prefix, file_suffix) = encoded_hash.split_at(2);
         let object_subdir = objects_dir.join(dir_prefix);
@@ -123,11 +184,11 @@ impl Repository {
             })?;
         }
 
-        fs::write(&object_file_path, &blob.compressed_content).with_context(|| {
+        fs::write(&object_file_path, &compressed_content).with_context(|| {
             format!("Failed to write object file {}", object_file_path.display())
         })?;
 
-        Ok(blob.hash)
+        Ok((sha1, encoded_hash))
     }
 
     pub fn add_to_index(&self, file_path: &PathBuf) -> Result<()> {
@@ -147,22 +208,22 @@ impl Repository {
         let data = fs::read_to_string(&file_path)
             .with_context(|| format!("Failed to read file {}", file_path.display()))?;
 
-        let encoded_hash = self.write_object(&data)?;
+        let (sha1, _) = self.write_object(Some(&data))?;
 
         let mut index = self.read_index()?;
 
         if let Some(pos) = index.entries.iter().position(|e| e.path == file_path_buf) {
-            if index.entries[pos].sha1 != encoded_hash {
+            if index.entries[pos].sha1 != sha1 {
                 index.entries[pos] = IndexEntry {
                     mode: 100644,
-                    sha1: encoded_hash,
+                    sha1,
                     path: file_path_buf,
                 };
             }
         } else {
             index.entries.push(IndexEntry {
                 mode: 100644,
-                sha1: encoded_hash,
+                sha1,
                 path: file_path_buf,
             });
         }
@@ -222,27 +283,40 @@ impl Repository {
             format!("Failed to read object file {}", object_file_path.display())
         })?;
 
-        let decompressed_data = decompress_content(&compressed_data)
-            .with_context(|| format!("Failed to decompress object {}", object_hash_str))?;
+        let decompressed = decompress_content(&compressed_data)?;
 
-        let position = decompressed_data
-            .find(' ')
-            .with_context(|| format!("Invalid content {}", object_hash_str))?;
+        let space = decompressed.iter().position(|&b| b == b' ').unwrap();
+        let null_terminator_position = decompressed.iter().position(|&b| b == 0).unwrap();
 
-        let object_type = &decompressed_data[0..position];
-        let null_terminator_position = decompressed_data
-            .find('\0')
-            .with_context(|| format!("Invalid content {}", object_hash_str))?;
+        let object_type = std::str::from_utf8(&decompressed[0..space])?;
+        let content = &decompressed[null_terminator_position + 1..];
 
         match object_type {
-            "blob" => Ok(GitObjects::Blob(BlobObject::new(
-                &decompressed_data[null_terminator_position..],
-            )?)),
+            "blob" => Ok(GitObjects::Blob(BlobObject::new(&String::from_utf8(
+                content.to_vec(),
+            )?)?)),
+            "tree" => {
+                // TODO(fcasibu): Should parse content instead of reading from the index
+                let index = self.read_index()?;
+                Ok(GitObjects::Tree(TreeObject::new(&index.entries)?))
+            }
             _ => Err(anyhow!(
                 "Object type \"{}\" not yet implemented",
                 object_type
             )),
         }
+    }
+
+    pub fn write_tree(&self) -> Result<([u8; 20], String)> {
+        let objects_dir = &self.objects_dir;
+
+        if !objects_dir.is_dir() {
+            return Err(anyhow!(
+                "fatal: not a mini-git repository (or any of the parent directories): .mini-git"
+            ));
+        }
+
+        self.write_object(None)
     }
 
     fn get_object_path(&self, hash_str: &str) -> Result<PathBuf> {
@@ -317,25 +391,28 @@ enum Commands {
         #[arg(long)]
         stage: bool,
     },
+
+    /// Create tree from the current inde
+    WriteTree,
 }
 
-fn hash_content(content_with_header: &str) -> [u8; 20] {
+fn hash_content(content_with_header: &[u8]) -> [u8; 20] {
     let mut hasher = Sha1::new();
-    hasher.update(content_with_header.as_bytes());
+    hasher.update(content_with_header);
     hasher.finalize().into()
 }
 
-fn compress_content(content: &str) -> Result<Vec<u8>> {
+fn compress_content(content: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(content.as_bytes())?;
+    encoder.write_all(content)?;
     encoder.finish().map_err(anyhow::Error::from)
 }
 
-fn decompress_content(encoded_data: &[u8]) -> Result<String> {
+fn decompress_content(encoded_data: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = ZlibDecoder::new(Vec::new());
     decoder.write_all(encoded_data)?;
     let decompressed_bytes = decoder.finish()?;
-    String::from_utf8(decompressed_bytes).map_err(anyhow::Error::from)
+    Ok(decompressed_bytes)
 }
 
 fn handle_hash_object_command(
@@ -363,7 +440,8 @@ fn handle_hash_object_command(
     let mut encoded_hash = String::new();
 
     if write {
-        encoded_hash = String::from_utf8(repository.write_object(&input_data)?.to_vec())?;
+        let (_, hash_str) = repository.write_object(Some(&input_data))?;
+        encoded_hash = hash_str;
     }
 
     println!("{}", encoded_hash);
@@ -416,6 +494,41 @@ fn handle_cat_file_command(
                 println!("{}", &blob_object.raw_content);
             }
         }
+
+        GitObjects::Tree(tree_object) => {
+            if show_type {
+                println!("tree")
+            }
+
+            if print_content {
+                let raw = &tree_object.raw_content;
+                let mut i = 0;
+
+                while i < raw.len() {
+                    let mode_start = i;
+                    while raw[i] != b' ' {
+                        i += 1;
+                    }
+                    let mode = std::str::from_utf8(&raw[mode_start..i])?;
+                    i += 1;
+
+                    let path_start = i;
+                    while raw[i] != 0 {
+                        i += 1;
+                    }
+                    let path = std::str::from_utf8(&raw[path_start..i])?;
+                    i += 1;
+
+                    if i + 20 > raw.len() {
+                        return Err(anyhow::anyhow!("Malformed tree object: SHA-1 truncated"));
+                    }
+                    let sha1 = &raw[i..i + 20];
+                    i += 20;
+
+                    println!("{mode} {} {path}", hex::encode(sha1));
+                }
+            }
+        }
     }
 
     Ok(())
@@ -434,6 +547,13 @@ fn handle_ls_files_command(stage: bool, repository: &Repository) -> Result<()> {
             );
         }
     }
+
+    Ok(())
+}
+
+fn handle_write_tree(repository: &Repository) -> Result<()> {
+    let (_, hash_str) = repository.write_tree()?;
+    println!("{hash_str}");
 
     Ok(())
 }
@@ -461,6 +581,7 @@ fn main() -> Result<()> {
         Commands::LsFiles { stage } => {
             handle_ls_files_command(stage, &repository)?;
         }
+        Commands::WriteTree => handle_write_tree(&repository)?,
     }
 
     Ok(())
