@@ -13,6 +13,7 @@ use std::{
 struct BlobObject {
     hash: [u8; 20],
     compressed_content: Vec<u8>,
+    raw_content: String,
 }
 
 impl BlobObject {
@@ -20,10 +21,150 @@ impl BlobObject {
         let object_content = format!("blob {}\0{}", raw_content.bytes().len(), raw_content);
         let compressed_content = compress_content(&object_content)
             .with_context(|| format!("Failed to compress blob content"))?;
+
         Ok(BlobObject {
             hash: hash_content(&object_content),
             compressed_content,
+            raw_content: raw_content.to_string(),
         })
+    }
+}
+
+enum GitObjects {
+    Blob(BlobObject),
+}
+
+struct Repository {
+    objects_dir: PathBuf,
+    mini_git_dir: PathBuf,
+}
+
+impl Repository {
+    pub fn new() -> Result<Self> {
+        let mini_git_dir = env::current_dir()?.join(".mini-git");
+        let objects_dir = mini_git_dir.join("objects");
+
+        Ok(Repository {
+            objects_dir,
+            mini_git_dir,
+        })
+    }
+
+    pub fn init(&self) -> Result<()> {
+        let mini_git_dir = &self.mini_git_dir;
+        let objects_dir = &self.objects_dir;
+
+        if mini_git_dir.exists() {
+            println!(
+                "Reinitialized existing MiniGit repository in {}",
+                mini_git_dir.display()
+            );
+        } else {
+            fs::create_dir(&mini_git_dir).with_context(|| {
+                format!(
+                    "Failed to create .mini-git directory at {}",
+                    mini_git_dir.display()
+                )
+            })?;
+            println!(
+                "Initialized empty MiniGit repository in {}",
+                mini_git_dir.display()
+            );
+        }
+
+        fs::create_dir_all(&objects_dir).context("Failed to create objects directory")?;
+        fs::create_dir_all(mini_git_dir.join("refs").join("heads"))
+            .context("Failed to create refs/heads directory")?;
+        fs::create_dir_all(mini_git_dir.join("refs").join("tags"))
+            .context("Failed to create refs/tags directory")?;
+
+        let head_file = mini_git_dir.join("HEAD");
+        if !head_file.exists() {
+            fs::write(&head_file, "ref: refs/heads/main\n")
+                .with_context(|| format!("Failed to write HEAD file at {}", head_file.display()))?;
+        }
+
+        Ok(())
+    }
+
+    pub fn write_object(&self, input_data: &str) -> Result<String> {
+        let objects_dir = &self.objects_dir;
+
+        if !objects_dir.is_dir() {
+            return Err(anyhow!(
+                "fatal: not a mini-git repository (or any of the parent directories): .mini-git"
+            ));
+        }
+
+        let blob = BlobObject::new(&input_data)?;
+        let encoded_hash = encode(blob.hash);
+
+        let (dir_prefix, file_suffix) = encoded_hash.split_at(2);
+        let object_subdir = objects_dir.join(dir_prefix);
+        let object_file_path = object_subdir.join(file_suffix);
+
+        if !object_subdir.exists() {
+            fs::create_dir(&object_subdir).with_context(|| {
+                format!(
+                    "Failed to create object subdirectory {}",
+                    object_subdir.display()
+                )
+            })?;
+        }
+
+        fs::write(&object_file_path, &blob.compressed_content).with_context(|| {
+            format!("Failed to write object file {}", object_file_path.display())
+        })?;
+
+        Ok(encoded_hash)
+    }
+
+    pub fn read_object(&self, object_hash_str: &str) -> Result<GitObjects> {
+        let objects_dir = &self.objects_dir;
+
+        if !objects_dir.is_dir() {
+            return Err(anyhow!(
+                "fatal: not a mini-git repository (or any of the parent directories): .mini-git"
+            ));
+        }
+
+        let object_file_path = self.get_object_path(&object_hash_str)?;
+
+        if !object_file_path.exists() {
+            return Err(anyhow!("fatal: object {} does not exist", object_hash_str));
+        }
+
+        let compressed_data = fs::read(&object_file_path).with_context(|| {
+            format!("Failed to read object file {}", object_file_path.display())
+        })?;
+
+        let decompressed_data = decompress_content(&compressed_data)
+            .with_context(|| format!("Failed to decompress object {}", object_hash_str))?;
+
+        let position = decompressed_data.find(' ').unwrap();
+        let object_type = &decompressed_data[0..position];
+        let null_terminator_position = decompressed_data.find('\0').unwrap();
+
+        match object_type {
+            "blob" => Ok(GitObjects::Blob(BlobObject::new(
+                &decompressed_data[null_terminator_position..],
+            )?)),
+            _ => Err(anyhow!(
+                "Object type \"{}\" not yet implemented",
+                object_type
+            )),
+        }
+    }
+
+    fn get_object_path(&self, hash_str: &str) -> Result<PathBuf> {
+        let objects_dir = &self.objects_dir;
+
+        if hash_str.len() != 40 {
+            return Err(anyhow!("Invalid hash length: '{}'", hash_str));
+        }
+
+        let (dir_prefix, file_suffix) = hash_str.split_at(2);
+        Ok(objects_dir.join(dir_prefix).join(file_suffix))
     }
 }
 
@@ -79,52 +220,11 @@ fn decompress_content(encoded_data: &[u8]) -> Result<String> {
     String::from_utf8(decompressed_bytes).map_err(anyhow::Error::from)
 }
 
-fn handle_init_command() -> Result<()> {
-    let mini_git_dir = env::current_dir()?.join(".mini-git");
-
-    if mini_git_dir.exists() {
-        println!(
-            "Reinitialized existing MiniGit repository in {}",
-            mini_git_dir.display()
-        );
-    } else {
-        fs::create_dir(&mini_git_dir).with_context(|| {
-            format!(
-                "Failed to create .mini-git directory at {}",
-                mini_git_dir.display()
-            )
-        })?;
-        println!(
-            "Initialized empty MiniGit repository in {}",
-            mini_git_dir.display()
-        );
-    }
-
-    fs::create_dir_all(mini_git_dir.join("objects"))
-        .context("Failed to create objects directory")?;
-    fs::create_dir_all(mini_git_dir.join("refs").join("heads"))
-        .context("Failed to create refs/heads directory")?;
-    fs::create_dir_all(mini_git_dir.join("refs").join("tags"))
-        .context("Failed to create refs/tags directory")?;
-
-    let head_file = mini_git_dir.join("HEAD");
-    if !head_file.exists() {
-        fs::write(&head_file, "ref: refs/heads/main\n")
-            .with_context(|| format!("Failed to write HEAD file at {}", head_file.display()))?;
-    }
-
-    Ok(())
-}
-
-fn get_object_path(base_objects_dir: &Path, hash_str: &str) -> Result<PathBuf> {
-    if hash_str.len() != 40 {
-        return Err(anyhow!("Invalid hash length: '{}'", hash_str));
-    }
-    let (dir_prefix, file_suffix) = hash_str.split_at(2);
-    Ok(base_objects_dir.join(dir_prefix).join(file_suffix))
-}
-
-fn handle_hash_object_command(file_path: Option<String>, write: bool) -> Result<()> {
+fn handle_hash_object_command(
+    file_path: Option<String>,
+    write: bool,
+    repository: &Repository,
+) -> Result<()> {
     let mut input_data = String::new();
 
     if let Some(path) = file_path {
@@ -142,35 +242,10 @@ fn handle_hash_object_command(file_path: Option<String>, write: bool) -> Result<
         input_data = input_data.trim_end_matches('\n').to_string();
     }
 
-    let blob = BlobObject::new(&input_data)?;
-    let encoded_hash = encode(blob.hash);
+    let mut encoded_hash = String::new();
 
     if write {
-        let current_dir = env::current_dir()?;
-        let objects_dir = current_dir.join(".mini-git/objects");
-
-        if !objects_dir.is_dir() {
-            return Err(anyhow!(
-                "fatal: not a mini-git repository (or any of the parent directories): .mini-git"
-            ));
-        }
-
-        let (dir_prefix, file_suffix) = encoded_hash.split_at(2);
-        let object_subdir = objects_dir.join(dir_prefix);
-        let object_file_path = object_subdir.join(file_suffix);
-
-        if !object_subdir.exists() {
-            fs::create_dir(&object_subdir).with_context(|| {
-                format!(
-                    "Failed to create object subdirectory {}",
-                    object_subdir.display()
-                )
-            })?;
-        }
-
-        fs::write(&object_file_path, &blob.compressed_content).with_context(|| {
-            format!("Failed to write object file {}", object_file_path.display())
-        })?;
+        encoded_hash = repository.write_object(&input_data)?;
     }
 
     println!("{}", encoded_hash);
@@ -181,6 +256,7 @@ fn handle_cat_file_command(
     object_hash_input: Option<String>,
     show_type: bool,
     print_content: bool,
+    repository: &Repository,
 ) -> Result<()> {
     let object_hash_str = match object_hash_input {
         Some(text) => text.trim().to_string(),
@@ -210,49 +286,17 @@ fn handle_cat_file_command(
         ));
     }
 
-    let current_dir = env::current_dir()?;
-    let objects_dir = current_dir.join(".mini-git/objects");
+    let object = repository.read_object(&object_hash_str)?;
 
-    if !objects_dir.is_dir() {
-        return Err(anyhow!(
-            "fatal: not a mini-git repository (or any of the parent directories): .mini-git"
-        ));
-    }
+    match object {
+        GitObjects::Blob(blob_object) => {
+            if show_type {
+                println!("blob")
+            }
 
-    let object_file_path = get_object_path(&objects_dir, &object_hash_str)?;
-
-    if !object_file_path.exists() {
-        return Err(anyhow!(
-            "fatal: Not a valid object name {}",
-            object_hash_str
-        ));
-    }
-
-    let compressed_data = fs::read(&object_file_path)
-        .with_context(|| format!("Failed to read object file {}", object_file_path.display()))?;
-
-    let decompressed_object_data = decompress_content(&compressed_data)
-        .with_context(|| format!("Failed to decompress object {}", object_hash_str))?;
-
-    if show_type {
-        if let Some(space_pos) = decompressed_object_data.find(' ') {
-            println!("{}", &decompressed_object_data[..space_pos]);
-        } else {
-            return Err(anyhow!(
-                "fatal: malformed object {} (missing type or space)",
-                object_hash_str
-            ));
-        }
-    }
-
-    if print_content {
-        if let Some(null_pos) = decompressed_object_data.find('\0') {
-            println!("{}", &decompressed_object_data[null_pos + 1..]);
-        } else {
-            return Err(anyhow!(
-                "fatal: malformed object {} (missing null terminator)",
-                object_hash_str
-            ));
+            if print_content {
+                println!("{}", &blob_object.raw_content);
+            }
         }
     }
 
@@ -262,14 +306,20 @@ fn handle_cat_file_command(
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let repository = Repository::new()?;
+
     match cli.command {
-        Commands::Init => handle_init_command()?,
-        Commands::HashObject { file_path, write } => handle_hash_object_command(file_path, write)?,
+        Commands::Init => {
+            repository.init()?;
+        }
+        Commands::HashObject { file_path, write } => {
+            handle_hash_object_command(file_path, write, &repository)?
+        }
         Commands::CatFile {
             object_hash_input,
             show_type,
             print_content,
-        } => handle_cat_file_command(object_hash_input, show_type, print_content)?,
+        } => handle_cat_file_command(object_hash_input, show_type, print_content, &repository)?,
     }
 
     Ok(())
