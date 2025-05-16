@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.98"
 bincode = "2.0.1"
+chrono = "0.4.41"
 clap = { version = "4.5.38", features = ["derive"] }
 flate2 = "1.1.1"
 hex = "0.4.3"

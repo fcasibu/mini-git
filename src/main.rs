@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, anyhow};
-use bincode::{self, Decode, Encode, config};
+use bincode::{Decode, Encode, config};
+use chrono::Local;
 use clap::{Parser, Subcommand};
 use flate2::Compression;
 use flate2::write::{ZlibDecoder, ZlibEncoder};
-use hex::encode;
+use hex::{decode_to_slice, encode};
 use sha1::{Digest, Sha1};
 use std::{
     env, fs,
@@ -72,9 +73,87 @@ impl TreeObject {
     }
 }
 
+struct CommitObject {
+    hash: [u8; 20],
+    compressed_content: Vec<u8>,
+    raw_content: Vec<u8>,
+}
+
+impl CommitObject {
+    pub fn new(
+        commit_message: &str,
+        tree_sha1_hex: &str,
+        parent_sha1: Option<&[u8; 20]>,
+    ) -> Result<Self> {
+        let now = Local::now();
+
+        let tree_hash = &tree_sha1_hex;
+        let timestamp = now.timestamp();
+        let offset_secs = now.offset().utc_minus_local();
+
+        let sign = if offset_secs >= 0 { "+" } else { "-" };
+        let abs_offset = offset_secs.abs();
+        let hours = abs_offset / 3600;
+        let minutes = (abs_offset % 3600) / 60;
+        let timezone = format!("{}{:02}{:02}", sign, hours, minutes);
+
+        let mut raw_content = Vec::new();
+        let metadata = if let Some(parent) = parent_sha1 {
+            format!(
+                "tree {}\n\
+parent {}\n\
+author Francis Eugene Casibu <email@example.com> {} {}\n\
+committer Francis Eugene Casibu <email@example.com> {} {}\n\n",
+                tree_hash,
+                encode(parent),
+                timestamp,
+                timezone,
+                timestamp,
+                timezone
+            )
+        } else {
+            format!(
+                "tree {}\n\
+author Francis Eugene Casibu <email@example.com> {} {}\n\
+committer Francis Eugene Casibu <email@example.com> {} {}\n\n",
+                tree_hash, timestamp, timezone, timestamp, timezone
+            )
+        };
+
+        raw_content.extend_from_slice(metadata.as_bytes());
+        raw_content.extend_from_slice(commit_message.as_bytes());
+
+        let header = format!("commit {}\0", raw_content.len());
+        let mut full_content = Vec::with_capacity(header.len() + raw_content.len());
+        full_content.extend_from_slice(header.as_bytes());
+        full_content.extend_from_slice(&raw_content);
+
+        let hash = hash_content(&full_content);
+        let compressed_content =
+            compress_content(&full_content).context("Failed to compress coommit object")?;
+
+        Ok(CommitObject {
+            hash,
+            compressed_content,
+            raw_content,
+        })
+    }
+}
+
 enum GitObjects {
     Blob(BlobObject),
     Tree(TreeObject),
+    Commit(CommitObject),
+}
+
+enum GitObjectsArgs {
+    Blob(String),
+    Tree,
+    Commit {
+        message: String,
+        tree_hash: String,
+        parent_hash: Option<[u8; 20]>,
+    },
 }
 
 struct Repository {
@@ -140,7 +219,7 @@ impl Repository {
         Ok(())
     }
 
-    pub fn write_object(&self, input_data: Option<&str>) -> Result<([u8; 20], String)> {
+    pub fn write_object(&self, object_args: &GitObjectsArgs) -> Result<([u8; 20], String)> {
         let objects_dir = &self.objects_dir;
 
         if !objects_dir.is_dir() {
@@ -149,8 +228,8 @@ impl Repository {
             ));
         }
 
-        let (compressed_content, sha1, encoded_hash) = match input_data {
-            Some(data) => {
+        let (compressed_content, sha1, encoded_hash) = match object_args {
+            GitObjectsArgs::Blob(data) => {
                 let blob_object = BlobObject::new(&data)?;
 
                 (
@@ -159,7 +238,7 @@ impl Repository {
                     encode(blob_object.hash),
                 )
             }
-            None => {
+            GitObjectsArgs::Tree => {
                 let index = self.read_index()?;
                 let tree_object = TreeObject::new(&index.entries)?;
 
@@ -167,6 +246,19 @@ impl Repository {
                     tree_object.compressed_content,
                     tree_object.hash,
                     encode(tree_object.hash),
+                )
+            }
+            GitObjectsArgs::Commit {
+                message,
+                tree_hash,
+                parent_hash,
+            } => {
+                let commit_object = CommitObject::new(message, tree_hash, parent_hash.as_ref())?;
+
+                (
+                    commit_object.compressed_content,
+                    commit_object.hash,
+                    encode(commit_object.hash),
                 )
             }
         };
@@ -208,7 +300,7 @@ impl Repository {
         let data = fs::read_to_string(&file_path)
             .with_context(|| format!("Failed to read file {}", file_path.display()))?;
 
-        let (sha1, _) = self.write_object(Some(&data))?;
+        let (sha1, _) = self.write_object(&GitObjectsArgs::Blob(data))?;
 
         let mut index = self.read_index()?;
 
@@ -296,9 +388,18 @@ impl Repository {
                 content.to_vec(),
             )?)?)),
             "tree" => {
-                // TODO(fcasibu): Should parse content instead of reading from the index
                 let index = self.read_index()?;
                 Ok(GitObjects::Tree(TreeObject::new(&index.entries)?))
+            }
+            "commit" => {
+                let raw_content = decompressed[null_terminator_position + 1..].to_vec();
+                let hash = hash_content(&decompressed);
+
+                Ok(GitObjects::Commit(CommitObject {
+                    hash,
+                    compressed_content: compressed_data,
+                    raw_content,
+                }))
             }
             _ => Err(anyhow!(
                 "Object type \"{}\" not yet implemented",
@@ -316,7 +417,40 @@ impl Repository {
             ));
         }
 
-        self.write_object(None)
+        self.write_object(&GitObjectsArgs::Tree)
+    }
+
+    pub fn commit_tree(
+        &self,
+        message: String,
+        tree_hash: String,
+        parent_hash: Option<[u8; 20]>,
+    ) -> Result<([u8; 20], String)> {
+        let objects_dir = &self.objects_dir;
+
+        if !objects_dir.is_dir() {
+            return Err(anyhow!(
+                "fatal: not a mini-git repository (or any of the parent directories): .mini-git"
+            ));
+        }
+
+        if !self.get_object_path(&tree_hash)?.exists() {
+            return Err(anyhow!("Tree hash not a valid object"));
+        }
+
+        if parent_hash.is_some()
+            && !self
+                .get_object_path(&encode(&parent_hash.unwrap()))?
+                .exists()
+        {
+            return Err(anyhow!("Parent hash not a valid object"));
+        }
+
+        self.write_object(&GitObjectsArgs::Commit {
+            message,
+            tree_hash,
+            parent_hash,
+        })
     }
 
     fn get_object_path(&self, hash_str: &str) -> Result<PathBuf> {
@@ -332,7 +466,6 @@ impl Repository {
 }
 
 #[derive(Encode, Decode, Debug, Ord, PartialOrd, Eq, PartialEq)]
-// TODO(fcasibu): ctime, mtime
 struct IndexEntry {
     mode: u32,
     sha1: [u8; 20],
@@ -353,47 +486,33 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Initialize a new MiniGit repository
     Init,
-
-    /// Compute object ID and optionally creates a blob from a file
     HashObject {
         file_path: Option<String>,
-
-        /// Write object to object database
         #[arg(short)]
         write: bool,
     },
-
-    /// Provide content or type information for repository objects
     CatFile {
         object_hash_input: Option<String>,
-
-        /// Show type of given object
         #[arg(short = 't', conflicts_with = "print_content")]
         show_type: bool,
-
-        /// Pretty-print given object content
         #[arg(short = 'p', conflicts_with = "show_type")]
         print_content: bool,
     },
-
-    /// Register file contents in the workking directory to the index
     UpdateIndex {
-        /// Add files not already in index
         #[arg(long)]
         add: String,
     },
-
-    /// Information about files in index/working directory
     LsFiles {
-        /// Show stage files in output
         #[arg(long)]
         stage: bool,
     },
-
-    /// Create tree from the current inde
     WriteTree,
+    CommitTree {
+        tree_hash_input: String,
+        #[arg(short)]
+        parent: Option<String>,
+    },
 }
 
 fn hash_content(content_with_header: &[u8]) -> [u8; 20] {
@@ -437,12 +556,13 @@ fn handle_hash_object_command(
         input_data = input_data.trim_end_matches('\n').to_string();
     }
 
-    let mut encoded_hash = String::new();
-
-    if write {
-        let (_, hash_str) = repository.write_object(Some(&input_data))?;
-        encoded_hash = hash_str;
-    }
+    let encoded_hash = if write {
+        let (_, hash_str) = repository.write_object(&GitObjectsArgs::Blob(input_data))?;
+        hash_str
+    } else {
+        let blob = BlobObject::new(&input_data)?;
+        encode(blob.hash)
+    };
 
     println!("{}", encoded_hash);
     Ok(())
@@ -529,6 +649,17 @@ fn handle_cat_file_command(
                 }
             }
         }
+
+        GitObjects::Commit(commit_object) => {
+            if show_type {
+                println!("commit")
+            }
+
+            if print_content {
+                let content_str = std::str::from_utf8(&commit_object.raw_content)?;
+                println!("{}", content_str);
+            }
+        }
     }
 
     Ok(())
@@ -558,9 +689,39 @@ fn handle_write_tree(repository: &Repository) -> Result<()> {
     Ok(())
 }
 
+fn handle_commit_tree(
+    target_tree_hash: String,
+    parent_hash_hex_opt: &Option<String>,
+    repository: &Repository,
+) -> Result<()> {
+    let mut commit_message = String::new();
+    io::stdin()
+        .read_to_string(&mut commit_message)
+        .context("Failed to read commit message from stdin")?;
+    commit_message = commit_message.trim_end_matches('\n').to_string();
+
+    let parent_sha1_bytes: Option<[u8; 20]> = parent_hash_hex_opt
+        .as_ref()
+        .map(|hex_str| {
+            if hex_str.len() != 40 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(anyhow!("Invalid parent commit hash format: {}", hex_str));
+            }
+            let mut decoded_bytes = [0u8; 20];
+            decode_to_slice(hex_str, &mut decoded_bytes)
+                .map_err(|e| anyhow!("Failed to decode parent hash '{}': {}", hex_str, e))?;
+            Ok(decoded_bytes)
+        })
+        .transpose()?;
+
+    let (_, hash_str) =
+        repository.commit_tree(commit_message, target_tree_hash, parent_sha1_bytes)?;
+
+    println!("{hash_str}");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
     let repository = Repository::new()?;
 
     match cli.command {
@@ -582,6 +743,10 @@ fn main() -> Result<()> {
             handle_ls_files_command(stage, &repository)?;
         }
         Commands::WriteTree => handle_write_tree(&repository)?,
+        Commands::CommitTree {
+            tree_hash_input,
+            parent,
+        } => handle_commit_tree(tree_hash_input, &parent, &repository)?,
     }
 
     Ok(())
